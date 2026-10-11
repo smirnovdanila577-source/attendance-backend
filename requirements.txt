@@ -5,3 +5,4 @@ beautifulsoup4
 pydantic
 sqlalchemy
 curl_cffi
+psycopg[binary]
