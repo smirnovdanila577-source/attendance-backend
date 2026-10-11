@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from parser import get_schedule
+from parser_ispu_fixed import get_schedule_ispu
 import models
 from database import engine, get_db
 
@@ -92,10 +93,14 @@ def _check_login_allowed(key: str):
         raise HTTPException(status_code=429, detail="Слишком много попыток входа. Попробуйте через несколько минут")
 
 # --- СХЕМЫ ДАННЫХ ---
+# Допустимые значения вуза при регистрации (всё остальное трактуется как ННГУ, как раньше)
+ALLOWED_UNIVERSITIES = {"ННГУ им. Лобачевского", "ИГЭУ", "Другой вуз"}
+
 class UserRegisterRequest(BaseModel):
     username: str
     password: str
     group_name: Optional[str] = None
+    university: Optional[str] = None
 
 class UserLoginRequest(BaseModel):
     username: str
@@ -135,8 +140,9 @@ def register_user(data: UserRegisterRequest, db: Session = Depends(get_db)):
     user = models.User(
         username=clean_username,
         password_hash=hash_password(clean_password),
-        university="ННГУ им. Лобачевского",
-        group_name=data.group_name.strip() if data.group_name else None
+        university=(data.university.strip() if data.university and data.university.strip() in ALLOWED_UNIVERSITIES
+                    else "ННГУ им. Лобачевского"),
+        group_name=data.group_name.strip()[:60] if data.group_name else None
     )
     db.add(user)
     db.commit()
@@ -222,3 +228,12 @@ def get_schedule_route_v2(group: str, date: str = None):
     
     print(f"[Бэкенд] Запрошена группа {group} на дату {date}")
     return get_schedule(group, date)
+
+
+# --- РАСПИСАНИЕ ИГЭУ ---
+@app.get("/api/schedule_ispu")
+def get_schedule_ispu_route(faculty: str, course: str, group: str, subgroup: Optional[str] = None):
+    """Тянет расписание группы с schedule.ispu.ru (две недели + сетка звонков).
+    Обычная (не async) функция: FastAPI сам запустит её в потоке, парсер блокирующий."""
+    print(f"[Бэкенд] ИГЭУ: факультет {faculty}, курс {course}, группа {group}, подгруппа {subgroup}")
+    return get_schedule_ispu(faculty, course, group, "permanent", subgroup or None)
