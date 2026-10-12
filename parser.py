@@ -1,6 +1,7 @@
 import re
 import json
 import os
+import colorsys
 from datetime import datetime
 from curl_cffi import requests
 
@@ -67,6 +68,42 @@ def type_from_text(text):
     return None
 
 
+def _color_family(color):
+    """Семейство цвета по оттенку: 'green', 'orange', 'pink' или None (белый, серые, насыщенные и прочие цвета)."""
+    c = str(color or "").strip().lower().replace(" ", "")
+    rgb = None
+    m = re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})", c)
+    if m:
+        h = m.group(1)
+        h = "".join(ch * 2 for ch in h) if len(h) == 3 else h
+        rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    else:
+        m = re.match(r"rgba?\((\d+),(\d+),(\d+)", c)
+        if m:
+            rgb = tuple(int(x) for x in m.groups())
+    if not rgb:
+        return None
+    hue, sat, val = colorsys.rgb_to_hsv(*(x / 255 for x in rgb))
+    if sat < 0.05:
+        return None  # белый и серые оттенки: цвета как такового нет
+    deg = hue * 360
+    if sat > 0.6:
+        return None  # на сайте занятия подкрашены бледными пастельными цветами, яркие это что-то другое
+    if 70 <= deg < 165:
+        return "green"
+    if 15 <= deg < 45:
+        return "orange"
+    if deg >= 330 or deg < 15:
+        return "pink"
+    return None
+
+
+# Цвета ячеек на сайте ННГУ (сверено со скриншотами сайта и окном «Информация о событии»):
+#   зелёный  #e6f5d7 = лекция,  персиковый #ffe4c4 = практика,  розовый #ffc0cb = лабораторная.
+_CONFIRMED_COLOR_TYPES = {"green": TYPE_LECTURE, "orange": TYPE_PRACTICE, "pink": TYPE_LAB}
+_GUESSED_COLOR_TYPES = {}  # места для будущих цветов (консультация, зачёт, экзамен), если они понадобятся
+
+
 def parse_color_legend(html: str) -> dict:
     """Ищет на странице подписи вида <span style="background:#ccffcc">Практика</span> и возвращает {цвет: тип}."""
     legend = {}
@@ -115,9 +152,12 @@ def detect_types(events: list, subjects: list, html: str):
     result = []
     for event, found, subject in zip(events, explicit, subjects):
         color = str(event.get("color", "")).lower()
-        kind = found or legend.get(color)
+        family = _color_family(color)
+        kind = found or legend.get(color) or _CONFIRMED_COLOR_TYPES.get(family)
         if not kind and color in votes:
             kind = max(votes[color].items(), key=lambda kv: kv[1])[0]
+        if not kind:
+            kind = _GUESSED_COLOR_TYPES.get(family)
         if not kind:
             # Последняя надежда: тип явно назван в самом предмете («Лабораторный практикум»)
             low = subject.lower()
@@ -211,6 +251,7 @@ def get_schedule(group_name: str, target_date: str, debug: bool = False) -> dict
                 "legend": legend,
                 "votes_by_color": votes,
                 "detected_types": lesson_types,
+                "color_families": {str(e.get("color", "")).lower(): _color_family(e.get("color")) for e in events_list},
                 "sample_events": events_list[:6],
             }
         return result
