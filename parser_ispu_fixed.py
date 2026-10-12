@@ -48,6 +48,10 @@ TTL_SCHEDULE = 3600 * 6
 _cache = {}
 _cache_lock = Lock()
 
+# Чтобы два одинаковых запроса не парсили сайт ИГЭУ одновременно: второй ждёт первого и берёт результат из кэша
+_inflight_guard = Lock()
+_inflight_locks = {}
+
 
 def _cache_get(key: str, ttl: int = 3600):
     with _cache_lock:
@@ -77,7 +81,9 @@ def _new_session():
 def _parse(response):
     response.raise_for_status()
     response.encoding = 'utf-8'
-    return BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
+    soup.raw_html = response.text  # нужен, чтобы таблицу расписания разобрать «как в браузере»
+    return soup
 
 
 def _collect_form(soup: BeautifulSoup) -> dict:
@@ -218,7 +224,7 @@ def get_groups(faculty: str, course: str, kind="permanent"):
         return {"success": False, "error": f"Не удалось получить список групп ИГЭУ: {e}"}
 
 
-def get_schedule_ispu(faculty: str, course: str, group: str, kind="permanent", subgroup_name=None):
+def _get_schedule_ispu_uncached(faculty: str, course: str, group: str, kind="permanent", subgroup_name=None):
     if not str(faculty).isdigit() or not str(course).isdigit() or not str(group).isdigit():
         return {"success": False, "error": "Неверные параметры группы"}
 
@@ -285,10 +291,22 @@ def get_schedule_ispu(faculty: str, course: str, group: str, kind="permanent", s
             res["subgroup"] = applied_subgroup
             
         _cache_set(key, res)
+        if applied_subgroup:
+            # тот же результат доступен и по явно названной подгруппе (первый запрос обычно идёт без неё)
+            _cache_set(f"schedule:{kind}:{faculty}:{course}:{group}:{applied_subgroup}", res)
         return res
 
     except Exception as e:
         return {"success": False, "error": f"Сбой загрузки расписания ИГЭУ: {e}"}
+
+
+def get_schedule_ispu(faculty: str, course: str, group: str, kind="permanent", subgroup_name=None):
+    """Публичная функция: то же самое, но одинаковые одновременные запросы выполняются по очереди (см. _inflight_locks)."""
+    lock_key = f"{kind}:{faculty}:{course}:{group}"
+    with _inflight_guard:
+        lock = _inflight_locks.setdefault(lock_key, Lock())
+    with lock:
+        return _get_schedule_ispu_uncached(faculty, course, group, kind, subgroup_name)
 
 
 def _norm_time(text):
@@ -333,7 +351,7 @@ def parse_schedule_table(table, slots_out=None):
         return {}
 
     grid = {}
-    rows = table.find_all("tr", recursive=False)
+    rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
     for r, tr in enumerate(rows):
         c = 0
         for td in tr.find_all(["td", "th"], recursive=False):
@@ -389,46 +407,68 @@ def parse_schedule_table(table, slots_out=None):
             if not raw_text:
                 continue
 
-            current_end = end_time
-            span = int(entry.get("rowspan", 1) or 1)
-            if span > 1:
-                last_cell = grid.get((r + span - 1, 1))
-                if isinstance(last_cell, tuple):
-                    last_cell = grid.get((last_cell[1], last_cell[2]))
-                
-                if last_cell:
-                    last_slot = _norm_time(last_cell.get_text(" "))
-                    if last_slot and last_slot != "00:00 - 00:00":
-                        _, current_end = _split_time(last_slot)
-                        
-            time_range = f"{start_time} - {current_end}"
-            
+            # Пара, растянутая на несколько строк (например, лабораторная на 2 пары), даёт по записи на каждую строку
+            span = min(max(int(entry.get("rowspan", 1) or 1), 1), 4)
+            time_ranges = []
+            for k in range(span):
+                cell_k = grid.get((r + k, 1))
+                if isinstance(cell_k, tuple):
+                    cell_k = grid.get((cell_k[1], cell_k[2]))
+                slot_k = _norm_time(cell_k.get_text(" ")) if cell_k is not None else "00:00 - 00:00"
+                if slot_k != "00:00 - 00:00":
+                    time_ranges.append(slot_k)
+            if not time_ranges:
+                time_ranges = [slot]
+
             bg_color = "#ffffff"
             style_m = re.search(r"background:\s*(#[0-9A-Fa-f]{6})", entry.get("style", ""), re.I)
             if style_m:
                 bg_color = style_m.group(1).lower()
 
             parts = [p.strip() for p in raw_text.split(";") if p.strip()] or [raw_text]
-            for part in parts:
-                les = parse_lesson(part)
-                kind_word = KIND_WORDS.get(les["kind"], les["kind"])
-                info = " ".join([x for x in (kind_word, les["teacher"], les["room"]) if x])
-                
-                weeks[week][day_key].append({
-                    "time": time_range,
-                    "subject": les["subject"],
-                    "info": info,
-                    "teacher": les["teacher"],
-                    "room": les["room"],
-                    "kind": les["kind"] or "лекция",
-                    "color": bg_color
-                })
+            for time_range in time_ranges:
+                for part in parts:
+                    les = parse_lesson(part)
+                    kind_word = KIND_WORDS.get(les["kind"], les["kind"])
+                    info = " ".join([x for x in (kind_word, les["teacher"], les["room"]) if x])
+
+                    weeks[week][day_key].append({
+                        "time": time_range,
+                        "subject": les["subject"],
+                        "info": info,
+                        "teacher": les["teacher"],
+                        "room": les["room"],
+                        "kind": les["kind"] or "лекция",
+                        "color": bg_color
+                    })
 
     return weeks
 
 
+def _browser_soup(soup):
+    """Разбор HTML так, как это делает браузер (достраивает незакрытые теги). Если нужных библиотек нет, вернёт None."""
+    raw = vars(soup).get("raw_html")
+    if not raw:
+        return None
+    for name in ("html5lib", "lxml"):
+        try:
+            return BeautifulSoup(raw, name)
+        except Exception:
+            continue
+    return None
+
+
+def _find_schedule_table(s):
+    return s.find("table", class_="shedule", id="sheduleTable") or s.find("table", id="sheduleTable")
+
+
 def parse_schedule_page(soup):
-    table = soup.find("table", class_="shedule", id="sheduleTable") or soup.find("table", id="sheduleTable")
+    table = None
+    browser = _browser_soup(soup)
+    if browser is not None:
+        table = _find_schedule_table(browser)
+    if table is None:
+        table = _find_schedule_table(soup)
     if not table:
         return {"success": False, "error": "На странице ИГЭУ не найдена таблица расписания"}
 
