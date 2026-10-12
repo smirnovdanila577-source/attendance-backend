@@ -4,6 +4,7 @@
 
 import re
 import time
+import threading
 from threading import Lock
 
 import requests
@@ -515,3 +516,36 @@ def parse_schedule_page(soup):
         "bells": bells,
         "weeks": weeks
     }
+
+
+# --- Фоновая загрузка ---
+# Прокси хостинга обрывает слишком долгие запросы, а сайт ИГЭУ бывает медленным. Поэтому загрузка идёт в отдельном потоке,
+# а запрос ждёт её ограниченное время. Не успела, вернём {"pending": True}: приложение спросит ещё раз и подхватит ту же загрузку.
+JOB_WAIT_SECONDS = 25
+_jobs = {}
+_jobs_lock = Lock()
+
+
+def _run_job(job, faculty, course, group, kind, subgroup_name):
+    try:
+        job["result"] = get_schedule_ispu(faculty, course, group, kind, subgroup_name)
+    except Exception as e:
+        job["result"] = {"success": False, "error": f"Сбой загрузки расписания ИГЭУ: {e}"}
+    job["finished"] = time.time()
+    job["event"].set()
+
+
+def get_schedule_ispu_job(faculty: str, course: str, group: str, kind="permanent", subgroup_name=None, wait=JOB_WAIT_SECONDS):
+    key = f"{kind}:{faculty}:{course}:{group}:{(subgroup_name or '').lower()}"
+    now = time.time()
+    with _jobs_lock:
+        for k in [k for k, j in _jobs.items() if j["event"].is_set() and now - j["finished"] > 3600]:
+            _jobs.pop(k, None)  # чистим старые завершённые загрузки
+        job = _jobs.get(key)
+        if job is None or (job["event"].is_set() and now - job["finished"] > 10):
+            job = {"event": threading.Event(), "result": None, "finished": 0.0}
+            _jobs[key] = job
+            threading.Thread(target=_run_job, args=(job, faculty, course, group, kind, subgroup_name), daemon=True).start()
+    if not job["event"].wait(wait):
+        return {"success": False, "pending": True}
+    return job["result"]
