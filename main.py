@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from parser import get_schedule
-from parser_ispu_fixed import get_schedule_ispu
+from parser_ispu_fixed import get_schedule_ispu_job
 import models
 from database import engine, get_db
 
@@ -207,7 +207,7 @@ def load_schedule(user_id: int, current_user_id: int = Depends(get_current_user_
 
 # --- ПОЛУЧЕНИЕ РАСПИСАНИЯ ЧЕРЕЗ ПАРСЕР ---
 @app.get("/api/schedule")
-def get_schedule_route(group: str, date: str = None):
+def get_schedule_route(group: str, date: str = None, debug: bool = False):
     from datetime import datetime
     
     # Если фронтенд прислал дату (например, для следующей недели) — используем её
@@ -215,25 +215,25 @@ def get_schedule_route(group: str, date: str = None):
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
         
-    return get_schedule(group, date)
+    return get_schedule(group, date, debug)
 
 from parser import get_schedule
 from datetime import datetime
 
 @app.get("/api/schedule_v2")
-def get_schedule_route_v2(group: str, date: str = None):
+def get_schedule_route_v2(group: str, date: str = None, debug: bool = False):
     # Если дата не пришла, берем сегодняшнюю
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
     
     print(f"[Бэкенд] Запрошена группа {group} на дату {date}")
-    return get_schedule(group, date)
+    return get_schedule(group, date, debug)
 
 
 # --- РАСПИСАНИЕ ИГЭУ ---
 @app.get("/api/schedule_ispu")
 def get_schedule_ispu_route(faculty: str, course: str, group: str, subgroup: Optional[str] = None):
     """Тянет расписание группы с schedule.ispu.ru (две недели + сетка звонков).
-    Обычная (не async) функция: FastAPI сам запустит её в потоке, парсер блокирующий."""
+    Загрузка идёт в фоне: если сайт отвечает медленно, вернётся {"pending": true}, и приложение спросит ещё раз."""
     print(f"[Бэкенд] ИГЭУ: факультет {faculty}, курс {course}, группа {group}, подгруппа {subgroup}")
-    return get_schedule_ispu(faculty, course, group, "permanent", subgroup or None)
+    return get_schedule_ispu_job(faculty, course, group, "permanent", subgroup or None)
