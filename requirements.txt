@@ -2,6 +2,7 @@ fastapi
 uvicorn
 requests
 beautifulsoup4
+html5lib
 pydantic
 sqlalchemy
 curl_cffi
