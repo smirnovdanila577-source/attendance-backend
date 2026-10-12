@@ -78,6 +78,29 @@ def _new_session():
     return ss
 
 
+# Сайт ИГЭУ отвечает нестабильно: на каждый запрос даём ограниченное время и несколько попыток,
+# вместо одного долгого ожидания (раньше первый GET вообще не имел таймаута).
+CONNECT_TIMEOUT = 8
+READ_TIMEOUT = 25
+HTTP_ATTEMPTS = 3
+
+
+def _http(session, method, **kwargs):
+    last_error = None
+    for attempt in range(HTTP_ATTEMPTS):
+        try:
+            resp = session.request(method, BASE_URL, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), **kwargs)
+            if resp.status_code >= 500:
+                raise requests.exceptions.HTTPError(f"HTTP {resp.status_code}", response=resp)
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+            last_error = e
+            print(f"[ИГЭУ] {method.upper()} попытка {attempt + 1}/{HTTP_ATTEMPTS} не удалась: {e}")
+            if attempt < HTTP_ATTEMPTS - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_error
+
+
 def _parse(response):
     response.raise_for_status()
     response.encoding = 'utf-8'
@@ -128,7 +151,7 @@ def _postback(session, soup: BeautifulSoup, target: str, overrides: dict = None)
     data["__EVENTTARGET"] = target
     data["__EVENTARGUMENT"] = ""
 
-    return _parse(session.post(BASE_URL, data=data, timeout=60))
+    return _parse(_http(session, "post", data=data))
 
 
 def _options(soup, field_name: str) -> list[dict]:
@@ -154,7 +177,7 @@ def _selected_text(soup, field_name: str) -> str:
 def _open_start_page(kind="permanent"):
     wanted = SCHEDULE_VALUES.get(kind, "144")
     session = _new_session()
-    soup = _parse(session.get(BASE_URL))
+    soup = _parse(_http(session, "get"))
 
     current = _selected_text(soup, F_SCHEDULE)
     if any(o.get("value") == wanted for o in soup.find_all("option")):
@@ -296,6 +319,9 @@ def _get_schedule_ispu_uncached(faculty: str, course: str, group: str, kind="per
             _cache_set(f"schedule:{kind}:{faculty}:{course}:{group}:{applied_subgroup}", res)
         return res
 
+    except requests.exceptions.RequestException as e:
+        print(f"[ИГЭУ] сайт не ответил: {e}")
+        return {"success": False, "error": "Сайт ИГЭУ сейчас не отвечает. Попробуй ещё раз через пару минут"}
     except Exception as e:
         return {"success": False, "error": f"Сбой загрузки расписания ИГЭУ: {e}"}
 
