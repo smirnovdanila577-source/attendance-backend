@@ -42,6 +42,8 @@ AVATAR_ACH = {"owl": "night_owl", "rooster": "early_bird", "rhino": "attend_100"
               "raccoon": "hw_10", "raven": "scholar", "lion": "league_podium", "capy": "first_friend",
               "cat": "important"}
 
+FREE_AVATARS = {"hedgehog", "bear", "penguin"}   # доступны всем сразу
+
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -257,5 +259,7 @@ def tag_allowed(tag: str, achievements: Set[str]) -> bool:
 
 
 def avatar_allowed(avatar: str, achievements: Set[str]) -> bool:
+    if avatar in FREE_AVATARS:
+        return True
     need = AVATAR_ACH.get(avatar)
     return bool(need) and need in achievements
