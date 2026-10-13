@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from parser import get_schedule
-from parser_ispu_fixed import get_schedule_ispu_job
+from parser_ispu_fixed import get_schedule_ispu_job, debug_ispu
 import models
 from database import engine, get_db
 
@@ -237,3 +237,9 @@ def get_schedule_ispu_route(faculty: str, course: str, group: str, subgroup: Opt
     Загрузка идёт в фоне: если сайт отвечает медленно, вернётся {"pending": true}, и приложение спросит ещё раз."""
     print(f"[Бэкенд] ИГЭУ: факультет {faculty}, курс {course}, группа {group}, подгруппа {subgroup}")
     return get_schedule_ispu_job(faculty, course, group, "permanent", subgroup or None)
+
+
+@app.get("/api/schedule_ispu_debug")
+def get_schedule_ispu_debug(faculty: str, course: str, group: str, subgroup: Optional[str] = None):
+    """Диагностика парсера ИГЭУ: что сервер видит на каждом шаге. Ничего не кэширует."""
+    return debug_ispu(faculty, course, group, subgroup or None)

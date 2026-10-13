@@ -549,3 +549,87 @@ def get_schedule_ispu_job(faculty: str, course: str, group: str, kind="permanent
     if not job["event"].wait(wait):
         return {"success": False, "pending": True}
     return job["result"]
+
+
+# --- Диагностика ---
+# Проходит те же шаги, что и загрузка расписания, но ничего не кэширует и возвращает,
+# что сервер видит на каждом шаге. Открыть: /api/schedule_ispu_debug?faculty=...&course=...&group=...
+
+def _select_info(soup, field_name, wanted=None, limit=15):
+    sel = soup.find("select", attrs={"name": field_name})
+    if not sel:
+        return {"found": False}
+    opts = [{"id": o.get("value"), "name": o.get_text(strip=True)} for o in sel.find_all("option")]
+    info = {
+        "found": True,
+        "selected": _selected_text(soup, field_name),
+        "count": len(opts),
+        "options": opts[:limit],
+    }
+    if wanted is not None:
+        info["wanted"] = str(wanted)
+        info["wanted_present"] = any(o["id"] == str(wanted) for o in opts)
+    return info
+
+
+def _page_info(soup):
+    title = soup.find("title")
+    heading = soup.find(["h1", "h2", "h3"])
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"Расписание[^.]{0,120}", text)
+    return {
+        "title": title.get_text(strip=True) if title else "",
+        "heading": heading.get_text(" ", strip=True)[:150] if heading else "",
+        "schedule_caption": m.group(0) if m else "",
+        "week_text": (re.search(r"[^.]{0,40}учебная[^.]{0,40}", text) or [""])[0],
+        "html_length": len(vars(soup).get("raw_html") or ""),
+        "table_ids": [t.get("id") for t in soup.find_all("table") if t.get("id")][:20],
+        "select_names": [s.get("name") for s in soup.find_all("select")],
+    }
+
+
+def debug_ispu(faculty: str, course: str, group: str, subgroup_name=None, kind="permanent"):
+    steps = []
+    t0 = time.time()
+
+    def step(name, soup, **extra):
+        info = {"step": name, "seconds": round(time.time() - t0, 1)}
+        info.update(_page_info(soup))
+        info["schedule_select"] = _select_info(soup, F_SCHEDULE, SCHEDULE_VALUES.get(kind))
+        info.update(extra)
+        steps.append(info)
+
+    try:
+        session = _new_session()
+        soup = _parse(_http(session, "get"))
+        step("start_page", soup)
+
+        wanted = SCHEDULE_VALUES.get(kind, "144")
+        if _select_info(soup, F_SCHEDULE, wanted).get("wanted_present") and _selected_text(soup, F_SCHEDULE) != wanted:
+            soup = _postback(session, soup, F_SCHEDULE, {F_SCHEDULE: wanted})
+            step("schedule_selected", soup)
+
+        soup = _postback(session, soup, F_FACULTY, {F_FACULTY: faculty})
+        step("faculty_selected", soup, faculty_select=_select_info(soup, F_FACULTY, faculty),
+             course_select=_select_info(soup, F_COURSE, course))
+
+        soup = _postback(session, soup, F_COURSE, {F_COURSE: course})
+        step("course_selected", soup, group_select=_select_info(soup, F_GROUP, group, limit=60))
+
+        soup = _postback(session, soup, F_GROUP, {F_GROUP: group})
+        rbl = soup.find("table", id="ContentPlaceHolder1_rblSubGroup")
+        subgroups = [lbl.get_text(strip=True) for lbl in rbl.find_all("label")] if rbl else []
+        browser = _browser_soup(soup)
+        step("group_selected", soup,
+             subgroups=subgroups,
+             table_found_html_parser=_find_schedule_table(soup) is not None,
+             table_found_browser_parser=(_find_schedule_table(browser) is not None) if browser is not None else None,
+             browser_parser_available=browser is not None)
+
+        result = parse_schedule_page(soup)
+        summary = {k: result.get(k) for k in ("success", "error", "current_week", "bells")}
+        if result.get("weeks"):
+            summary["lessons_per_week"] = {w: sum(len(v) for v in days.values()) for w, days in result["weeks"].items()}
+        return {"ok": True, "steps": steps, "parse_result": summary}
+    except Exception as e:
+        return {"ok": False, "steps": steps, "error": f"{type(e).__name__}: {e}"}
