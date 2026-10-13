@@ -25,13 +25,19 @@ SCHEDULE_VALUES = {
 
 DAY_KEYS = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
 
+# Подписи вида занятия на сайте ИГЭУ (собраны по всем факультетам, октябрь 2026)
 KIND_WORDS = {
     "лек": "лекция",
-    "сем": "практика",
-    "пр": "практика",
-    "практ": "практика",
-    "лаб": "лабораторная"
+    "сем": "семинар",
+    "лаб": "лабораторная",
+    "к.пр": "курсовой проект",
+    "к.раб": "курсовая работа",
 }
+# К какому типу трекера относится подпись: лек / сем (практика) / лаб
+KIND_TYPE = {"лек": "лек", "сем": "сем", "лаб": "лаб", "к.пр": "сем", "к.раб": "сем"}
+# Цвет ячейки по легенде сайта: жёлтый — лекция, зелёный — семинар/практика, розовый — лабораторная
+COLOR_TYPE = {"#ffffcc": "лек", "#e5ffe5": "сем", "#ffeffd": "лаб"}
+_KIND_RE = re.compile(r"(?<!\S)(к\.пр|к\.раб|лек|сем|лаб)\.(?=\s|$)", re.I)
 
 FALLBACK_FACULTIES = {
     "30000": "ИВТФ",
@@ -377,7 +383,10 @@ def _clean(text):
 
 def parse_lesson(text):
     text = re.sub(r'\((\d+)\)', r'(\1)', text)
-    m = re.search(r"(?<!\S)(лек|сем|лаб|практ|пр)\.(?=\s|$)", text, re.I)
+    # Вид занятия стоит после названия, перед преподавателем. Берём ПОСЛЕДНЕЕ совпадение:
+    # в названиях бывают сокращения вроде «Теория и практ. инж. исслед.»
+    found = list(_KIND_RE.finditer(text))
+    m = found[-1] if found else None
     if not m:
         return {"subject": text, "kind": "", "teacher": "", "room": ""}
 
@@ -479,6 +488,8 @@ def parse_schedule_table(table, slots_out=None):
                 for part in parts:
                     les = parse_lesson(part)
                     kind_word = KIND_WORDS.get(les["kind"], les["kind"])
+                    # Тип: по подписи, а если её нет — по цвету ячейки, как в легенде сайта
+                    kind_type = KIND_TYPE.get(les["kind"]) or COLOR_TYPE.get(bg_color) or "лек"
                     info = " ".join([x for x in (kind_word, les["teacher"], les["room"]) if x])
 
                     weeks[week][day_key].append({
@@ -487,7 +498,8 @@ def parse_schedule_table(table, slots_out=None):
                         "info": info,
                         "teacher": les["teacher"],
                         "room": les["room"],
-                        "kind": les["kind"] or "лекция",
+                        "kind": kind_type,                 # лек / сем / лаб — так его понимает приложение
+                        "kind_label": les["kind"] + "." if les["kind"] else "",
                         "color": bg_color
                     })
 
