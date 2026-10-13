@@ -306,6 +306,12 @@ def _get_schedule_ispu_uncached(faculty: str, course: str, group: str, kind="per
         # --------------------------
 
         res = parse_schedule_page(soup)
+        if not res.get("success") and available_subgroups and target_sg["checked"]:
+            # С осени 2026 сайт показывает таблицу только после явного выбора подгруппы,
+            # даже если она уже отмечена. Выбираем её принудительно и смотрим ещё раз.
+            event_target = f"{F_SUBGROUP_PREFIX}${target_sg['index']}"
+            soup = _postback(session, soup, event_target, {F_SUBGROUP_PREFIX: target_sg['id']})
+            res = parse_schedule_page(soup)
         if not res.get("success"):
             return res
 
@@ -588,6 +594,19 @@ def _page_info(soup):
     }
 
 
+def _radios(soup, table_id):
+    rbl = soup.find("table", id=table_id)
+    out = []
+    if not rbl:
+        return out
+    for i, inp in enumerate(rbl.find_all("input", type="radio")):
+        lbl = rbl.find("label", {"for": inp.get("id")})
+        out.append({"index": i, "id": inp.get("value"),
+                    "name": (lbl.get_text(strip=True).lower() if lbl else str(i)).replace("x", "х"),
+                    "checked": inp.has_attr("checked")})
+    return out
+
+
 def debug_ispu(faculty: str, course: str, group: str, subgroup_name=None, kind="permanent"):
     steps = []
     t0 = time.time()
@@ -617,16 +636,27 @@ def debug_ispu(faculty: str, course: str, group: str, subgroup_name=None, kind="
         step("course_selected", soup, group_select=_select_info(soup, F_GROUP, group, limit=60))
 
         soup = _postback(session, soup, F_GROUP, {F_GROUP: group})
-        rbl = soup.find("table", id="ContentPlaceHolder1_rblSubGroup")
-        subgroups = [lbl.get_text(strip=True) for lbl in rbl.find_all("label")] if rbl else []
         browser = _browser_soup(soup)
         step("group_selected", soup,
-             subgroups=subgroups,
+             subgroups=_radios(soup, "ContentPlaceHolder1_rblSubGroup"),
+             object_radios=_radios(soup, "ContentPlaceHolder1_rblObject"),
+             posted_fields=sorted(_collect_form(soup).keys()),
              table_found_html_parser=_find_schedule_table(soup) is not None,
              table_found_browser_parser=(_find_schedule_table(browser) is not None) if browser is not None else None,
              browser_parser_available=browser is not None)
 
         result = parse_schedule_page(soup)
+        if not result.get("success"):
+            # Пробуем то же, что делает парсер: принудительно выбрать подгруппу
+            radios = _radios(soup, "ContentPlaceHolder1_rblSubGroup")
+            pick = next((r for r in radios if subgroup_name and r["name"] == subgroup_name.lower()), radios[0] if radios else None)
+            if pick:
+                soup = _postback(session, soup, f"ctl00$ContentPlaceHolder1$rblSubGroup${pick['index']}",
+                                 {"ctl00$ContentPlaceHolder1$rblSubGroup": pick["id"]})
+                step("subgroup_forced", soup, picked=pick,
+                     subgroups=_radios(soup, "ContentPlaceHolder1_rblSubGroup"),
+                     table_found_html_parser=_find_schedule_table(soup) is not None)
+                result = parse_schedule_page(soup)
         summary = {k: result.get(k) for k in ("success", "error", "current_week", "bells")}
         if result.get("weeks"):
             summary["lessons_per_week"] = {w: sum(len(v) for v in days.values()) for w, days in result["weeks"].items()}
