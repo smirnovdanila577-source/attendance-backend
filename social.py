@@ -1,8 +1,9 @@
 """
 Социальная часть трекера: очки (XP), серия дней, лига недели, друзья, публичный профиль, общий онлайн.
 
-Очки и серию считает приложение по своим данным и присылает итог (POST /api/social/sync).
-Сервер проверяет разумные пределы, хранит и сравнивает пользователей между собой.
+Очки, серию и важные достижения считает сервер по событиям-отметкам (см. progress.py):
+приложение присылает «отметил пару / выполнил пункт ДЗ», а не готовые цифры.
+Через /api/social/sync приложение обновляет только внешний вид профиля (аватар, тег, «о себе», статус).
 """
 import json
 import re
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 import models
+import progress
 from database import get_db
 
 router = APIRouter(prefix="/api")
@@ -23,8 +25,6 @@ router = APIRouter(prefix="/api")
 MSK = timezone(timedelta(hours=3))
 ONLINE_WINDOW = timedelta(minutes=3)      # «в сети», если приложение отзывалось за последние 3 минуты
 LEAGUE_SIZE = 20
-MAX_WEEK_XP = 3000                        # больше за неделю честно не набрать
-MAX_TOTAL_XP = 1_000_000
 ALLOWED_STATUS = {"auto", "online", "offline", "sleep"}
 ID_RE = re.compile(r"^[a-z0-9_\-]{1,32}$")
 
@@ -100,11 +100,12 @@ def _card(db: Session, user: models.User, p: Optional[models.PublicProfile], wee
 # ---------- Схемы ----------
 
 class SyncRequest(BaseModel):
-    week_key: str
-    week_xp: int
-    xp_total: int
-    streak_days: int
-    streak_best: int
+    # Очки и серию сервер считает сам; эти поля старые версии приложения ещё присылают — они игнорируются
+    week_key: Optional[str] = None
+    week_xp: Optional[int] = None
+    xp_total: Optional[int] = None
+    streak_days: Optional[int] = None
+    streak_best: Optional[int] = None
     achievements: List[str] = []
     tag: str = ""
     avatar: str = ""
@@ -118,21 +119,65 @@ class FollowRequest(BaseModel):
     username: str
 
 
+class EventsRequest(BaseModel):
+    events: List[dict] = []
+
+
+def _league_members(db: Session, wk: str, user_id: int, include_me: bool):
+    """Участники лиги недели wk с местами. Пока людей мало — одна лига; потом группы по LEAGUE_SIZE."""
+    active = {uid: xp for uid, xp in progress.xp_by_week(db, wk).items() if xp > 0}
+    if include_me:
+        active.setdefault(user_id, 0)
+    ids = sorted(active)
+    if len(ids) > LEAGUE_SIZE:
+        # Стабильное деление на группы на всю неделю: по хэшу (неделя + id), чтобы соседи не менялись
+        groups = max(1, round(len(ids) / LEAGUE_SIZE))
+        gid = lambda uid: zlib.crc32(f"{wk}:{uid}".encode()) % groups
+        mine = gid(user_id)
+        ids = [i for i in ids if gid(i) == mine]
+    users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_(ids)).all()} if ids else {}
+    profs = {p.user_id: p for p in db.query(models.PublicProfile).filter(models.PublicProfile.user_id.in_(ids)).all()} if ids else {}
+    members = [_card(db, users[i], profs.get(i), active.get(i, 0)) for i in ids if i in users]
+    members.sort(key=lambda c: (-c["week_xp"], c["name"].lower()))
+    for n, c in enumerate(members, 1):
+        c["rank"] = n
+    return members
+
+
+def _state(db: Session, user_id: int, client_ach: Optional[List[str]] = None) -> dict:
+    """Прогресс по версии сервера + обновление публичного профиля этими цифрами."""
+    prev = _league_members(db, prev_week_key(), user_id, include_me=False)
+    me = next((c for c in prev if c["id"] == user_id), None)
+    podium = bool(me and me["rank"] <= 3 and me["week_xp"] > 0 and len(prev) >= 3)
+    following = {f.followee_id for f in db.query(models.Follow).filter(models.Follow.follower_id == user_id).all()}
+    friend = bool(following) and db.query(models.Follow).filter(
+        models.Follow.followee_id == user_id, models.Follow.follower_id.in_(following)).first() is not None
+    st = progress.compute_state(db, user_id, podium=podium, friend=friend)
+    p = _profile(db, user_id)
+    if client_ach is None:
+        try:
+            client_ach = json.loads(p.achievements or "[]")
+        except ValueError:
+            client_ach = []
+    allowed = progress.allowed_achievements(st["achievements"], client_ach)
+    p.achievements = json.dumps(sorted(allowed))
+    p.xp_total, p.streak_days = st["xp_total"], st["streak"]
+    p.streak_best = max(p.streak_best or 0, st["best_streak"])
+    if p.tag and not progress.tag_allowed(p.tag, allowed):
+        p.tag = "newbie"
+    if p.avatar and not progress.avatar_allowed(p.avatar, allowed):
+        p.avatar = ""
+    db.commit()
+    st["public_achievements"] = sorted(allowed)
+    return st
+
+
 def setup(get_current_user_id):
     """Подключение к авторизации из main.py (чтобы не было циклического импорта)."""
 
     @router.post("/social/sync")
     def social_sync(data: SyncRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-        if data.week_key != week_key():
-            # Часы устройства сильно врут или запрос из прошлой недели: принимаем профиль, очки недели — нет
-            week_ok = False
-        else:
-            week_ok = True
         p = _profile(db, user_id)
-        p.xp_total = max(0, min(int(data.xp_total), MAX_TOTAL_XP))
-        p.streak_days = max(0, min(int(data.streak_days), 3650))
-        p.streak_best = max(p.streak_days, min(int(data.streak_best), 3650))
-        p.achievements = json.dumps([a for a in data.achievements if ID_RE.match(a)][:100])
         p.tag = data.tag if ID_RE.match(data.tag or "") else ""
         p.avatar = data.avatar if ID_RE.match(data.avatar or "") else ""
         p.bio = (data.bio or "")[:80]
@@ -141,14 +186,26 @@ def setup(get_current_user_id):
         p.status_mode = data.status_mode if data.status_mode in ALLOWED_STATUS else "auto"
         p.last_seen = _now()
         p.updated_at = _now()
-        if week_ok:
-            row = db.get(models.WeeklyXP, (user_id, data.week_key))
-            if not row:
-                row = models.WeeklyXP(user_id=user_id, week_key=data.week_key, xp=0)
-                db.add(row)
-            row.xp = max(0, min(int(data.week_xp), MAX_WEEK_XP))
+        progress.touch_flags(db, user_id)
         db.commit()
-        return {"status": "ok", "week_key": week_key()}
+        # Тег и аватар проверяются по достижениям, подтверждённым сервером
+        st = _state(db, user_id, [a for a in data.achievements if a in progress.CLIENT_ACH])
+        return {"status": "ok", "week_key": week_key(), "state": st}
+
+    @router.post("/social/events")
+    def social_events(data: EventsRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+        """Отметки пар и ДЗ. Очки начисляет сервер по своим правилам и часам."""
+        user = db.get(models.User, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        res = progress.apply_events(db, user, data.events)
+        st = _state(db, user_id)
+        st["gained"] = res["gained"]
+        return st
+
+    @router.get("/social/state")
+    def social_state(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+        return _state(db, user_id)
 
     @router.post("/social/ping")
     def social_ping(status_mode: Optional[str] = None, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
@@ -157,6 +214,7 @@ def setup(get_current_user_id):
         p.last_seen = _now()
         if status_mode in ALLOWED_STATUS:
             p.status_mode = status_mode
+        progress.touch_flags(db, user_id)
         db.commit()
         return {"online": _online_count(db)}
 
@@ -168,23 +226,7 @@ def setup(get_current_user_id):
     def league(which: str = "current", user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
         """Лига недели. Пока людей мало — одна лига на всех; потом делим на группы по LEAGUE_SIZE."""
         wk = week_key() if which != "previous" else prev_week_key()
-        rows = db.query(models.WeeklyXP).filter(models.WeeklyXP.week_key == wk, models.WeeklyXP.xp > 0).all()
-        active = {r.user_id: r.xp for r in rows}
-        if which != "previous":
-            active.setdefault(user_id, active.get(user_id, 0))   # сам пользователь виден в лиге всегда
-        ids = sorted(active)
-        if len(ids) > LEAGUE_SIZE:
-            # Стабильное деление на группы на всю неделю: по хэшу (неделя + id), чтобы соседи не менялись
-            groups = max(1, round(len(ids) / LEAGUE_SIZE))
-            gid = lambda uid: zlib.crc32(f"{wk}:{uid}".encode()) % groups
-            mine = gid(user_id)
-            ids = [i for i in ids if gid(i) == mine]
-        users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_(ids)).all()}
-        profs = {p.user_id: p for p in db.query(models.PublicProfile).filter(models.PublicProfile.user_id.in_(ids)).all()}
-        members = [_card(db, users[i], profs.get(i), active.get(i, 0)) for i in ids if i in users]
-        members.sort(key=lambda c: (-c["week_xp"], c["name"].lower()))
-        for n, c in enumerate(members, 1):
-            c["rank"] = n
+        members = _league_members(db, wk, user_id, include_me=(which != "previous"))  # себя видно всегда
         me = next((c for c in members if c["id"] == user_id), None)
         now = datetime.now(MSK)
         ends = (now + timedelta(days=7 - now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -204,7 +246,7 @@ def setup(get_current_user_id):
         users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_(ids)).all()} if ids else {}
         profs = {p.user_id: p for p in db.query(models.PublicProfile).filter(models.PublicProfile.user_id.in_(ids)).all()} if ids else {}
         wk = week_key()
-        xp = {r.user_id: r.xp for r in db.query(models.WeeklyXP).filter(models.WeeklyXP.week_key == wk, models.WeeklyXP.user_id.in_(ids)).all()} if ids else {}
+        xp = progress.xp_by_week(db, wk, ids) if ids else {}
         out = []
         for i in ids:
             if i not in users:
@@ -246,8 +288,7 @@ def setup(get_current_user_id):
         if not user:
             raise HTTPException(status_code=404, detail="Пользователь не найден")
         p = db.get(models.PublicProfile, user.id)
-        row = db.get(models.WeeklyXP, (user.id, week_key()))
-        card = _card(db, user, p, row.xp if row else 0, full=True)
+        card = _card(db, user, p, progress.xp_by_week(db, week_key(), [user.id]).get(user.id, 0), full=True)
         card["you_follow"] = bool(db.get(models.Follow, (user_id, user.id)))
         card["follows_you"] = bool(db.get(models.Follow, (user.id, user_id)))
         return card

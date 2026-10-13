@@ -88,3 +88,53 @@ class Follow(Base):
     follower_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     followee_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# --- ЧЕСТНЫЙ ПОДСЧЁТ: отметки и ДЗ как события, очки начисляет только сервер ---
+
+class MarkEvent(Base):
+    """Отметка пары. pair_key = «дата|время|предмет». Очки даются один раз и только за свежую отметку."""
+    __tablename__ = "mark_events"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    pair_key = Column(String, primary_key=True)
+    pair_date = Column(String, nullable=False)       # YYYY-MM-DD
+    pair_end = Column(DateTime, nullable=False)      # конец пары, UTC
+    status = Column(String, nullable=True)           # a — был, m — пропуск, None — снята
+    first_seen = Column(DateTime, nullable=False)    # когда сервер впервые узнал об отметке
+    counted = Column(Boolean, default=False)         # дала ли очки
+    counted_on = Column(String, nullable=True)       # день начисления по Москве (для дневного лимита)
+
+
+class TaskEvent(Base):
+    """Пункт ДЗ. Очки, если между появлением пункта на сервере и выполнением прошло 30+ минут."""
+    __tablename__ = "task_events"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    task_key = Column(String, primary_key=True)
+    first_seen = Column(DateTime, nullable=False)
+    done_at = Column(DateTime, nullable=True)
+    counted = Column(Boolean, default=False)
+    counted_on = Column(String, nullable=True)
+
+
+class XpLedger(Base):
+    """Каждое начисление очков отдельной строкой: из неё строятся лига и сумма очков."""
+    __tablename__ = "xp_ledger"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    week_key = Column(String, index=True, nullable=False)
+    xp = Column(Integer, nullable=False)
+    reason = Column(String, nullable=False)          # pair / task / day
+    ref = Column(String, nullable=False)             # за что именно (ключ пары, задания или дня)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UserFlags(Base):
+    """Отметки сервера для секретных достижений: заходил ночью / рано утром (по московским часам)."""
+    __tablename__ = "user_flags"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    night = Column(Boolean, default=False)
+    early = Column(Boolean, default=False)
