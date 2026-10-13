@@ -175,15 +175,30 @@ def _selected_text(soup, field_name: str) -> str:
     return ""
 
 
+def _selected_value(soup, field_name: str) -> str:
+    """Значение (id), которое сейчас выбрано в списке. Без явного selected браузер берёт первый пункт."""
+    sel = soup.find("select", attrs={"name": field_name})
+    if not sel:
+        return ""
+    opt = sel.find("option", selected=True) or sel.find("option")
+    return opt.get("value", "") if opt else ""
+
+
+def _choose(session, soup, field_name: str, value: str):
+    """Выбирает пункт списка. Важно: сайт ИГЭУ теряет таблицу расписания, если «выбрать» уже выбранное
+    значение, поэтому постбэк делаем только когда значение действительно меняется."""
+    if _selected_value(soup, field_name) == str(value):
+        return soup
+    return _postback(session, soup, field_name, {field_name: str(value)})
+
+
 def _open_start_page(kind="permanent"):
     wanted = SCHEDULE_VALUES.get(kind, "144")
     session = _new_session()
     soup = _parse(_http(session, "get"))
 
-    current = _selected_text(soup, F_SCHEDULE)
     if any(o.get("value") == wanted for o in soup.find_all("option")):
-        if current != wanted:
-            soup = _postback(session, soup, F_SCHEDULE, {F_SCHEDULE: wanted})
+        soup = _choose(session, soup, F_SCHEDULE, wanted)
 
     return session, soup
 
@@ -220,8 +235,8 @@ def get_faculties(kind="permanent"):
 
 
 def _goto_course(session, soup, faculty: str, course: str):
-    soup = _postback(session, soup, F_FACULTY, {F_FACULTY: faculty})
-    soup = _postback(session, soup, F_COURSE, {F_COURSE: course})
+    soup = _choose(session, soup, F_FACULTY, faculty)
+    soup = _choose(session, soup, F_COURSE, course)
     return soup
 
 
@@ -266,7 +281,7 @@ def _get_schedule_ispu_uncached(faculty: str, course: str, group: str, kind="per
     try:
         session, soup = _open_start_page(kind)
         soup = _goto_course(session, soup, faculty, course)
-        soup = _postback(session, soup, F_GROUP, {F_GROUP: group})
+        soup = _choose(session, soup, F_GROUP, group)
 
         # --- ОБРАБОТКА ПОДГРУПП ---
         F_SUBGROUP_PREFIX = "ctl00$ContentPlaceHolder1$rblSubGroup"
@@ -306,11 +321,12 @@ def _get_schedule_ispu_uncached(faculty: str, course: str, group: str, kind="per
         # --------------------------
 
         res = parse_schedule_page(soup)
-        if not res.get("success") and available_subgroups and target_sg["checked"]:
-            # С осени 2026 сайт показывает таблицу только после явного выбора подгруппы,
-            # даже если она уже отмечена. Выбираем её принудительно и смотрим ещё раз.
-            event_target = f"{F_SUBGROUP_PREFIX}${target_sg['index']}"
-            soup = _postback(session, soup, event_target, {F_SUBGROUP_PREFIX: target_sg['id']})
+        if not res.get("success") and len(available_subgroups) > 1:
+            # Запасной путь: таблица пропала — переключаемся на соседнюю подгруппу и обратно
+            # (смена значения на сайте ИГЭУ всегда перерисовывает таблицу)
+            other = next(sg for sg in available_subgroups if sg["id"] != target_sg["id"])
+            soup = _postback(session, soup, f"{F_SUBGROUP_PREFIX}${other['index']}", {F_SUBGROUP_PREFIX: other['id']})
+            soup = _postback(session, soup, f"{F_SUBGROUP_PREFIX}${target_sg['index']}", {F_SUBGROUP_PREFIX: target_sg['id']})
             res = parse_schedule_page(soup)
         if not res.get("success"):
             return res
@@ -624,18 +640,18 @@ def debug_ispu(faculty: str, course: str, group: str, subgroup_name=None, kind="
         step("start_page", soup)
 
         wanted = SCHEDULE_VALUES.get(kind, "144")
-        if _select_info(soup, F_SCHEDULE, wanted).get("wanted_present") and _selected_text(soup, F_SCHEDULE) != wanted:
-            soup = _postback(session, soup, F_SCHEDULE, {F_SCHEDULE: wanted})
+        if _select_info(soup, F_SCHEDULE, wanted).get("wanted_present"):
+            soup = _choose(session, soup, F_SCHEDULE, wanted)
             step("schedule_selected", soup)
 
-        soup = _postback(session, soup, F_FACULTY, {F_FACULTY: faculty})
+        soup = _choose(session, soup, F_FACULTY, faculty)
         step("faculty_selected", soup, faculty_select=_select_info(soup, F_FACULTY, faculty),
              course_select=_select_info(soup, F_COURSE, course))
 
-        soup = _postback(session, soup, F_COURSE, {F_COURSE: course})
+        soup = _choose(session, soup, F_COURSE, course)
         step("course_selected", soup, group_select=_select_info(soup, F_GROUP, group, limit=60))
 
-        soup = _postback(session, soup, F_GROUP, {F_GROUP: group})
+        soup = _choose(session, soup, F_GROUP, group)
         browser = _browser_soup(soup)
         step("group_selected", soup,
              subgroups=_radios(soup, "ContentPlaceHolder1_rblSubGroup"),
@@ -645,18 +661,16 @@ def debug_ispu(faculty: str, course: str, group: str, subgroup_name=None, kind="
              table_found_browser_parser=(_find_schedule_table(browser) is not None) if browser is not None else None,
              browser_parser_available=browser is not None)
 
+        # Подгруппа: как в парсере — переключаем, только если нужна не та, что уже отмечена
+        radios = _radios(soup, "ContentPlaceHolder1_rblSubGroup")
+        target = next((r for r in radios if subgroup_name and r["name"] == subgroup_name.lower().replace("x", "х")), None)
+        if target and not target["checked"]:
+            soup = _postback(session, soup, f"ctl00$ContentPlaceHolder1$rblSubGroup${target['index']}",
+                             {"ctl00$ContentPlaceHolder1$rblSubGroup": target["id"]})
+            step("subgroup_selected", soup, picked=target,
+                 subgroups=_radios(soup, "ContentPlaceHolder1_rblSubGroup"),
+                 table_found_html_parser=_find_schedule_table(soup) is not None)
         result = parse_schedule_page(soup)
-        if not result.get("success"):
-            # Пробуем то же, что делает парсер: принудительно выбрать подгруппу
-            radios = _radios(soup, "ContentPlaceHolder1_rblSubGroup")
-            pick = next((r for r in radios if subgroup_name and r["name"] == subgroup_name.lower()), radios[0] if radios else None)
-            if pick:
-                soup = _postback(session, soup, f"ctl00$ContentPlaceHolder1$rblSubGroup${pick['index']}",
-                                 {"ctl00$ContentPlaceHolder1$rblSubGroup": pick["id"]})
-                step("subgroup_forced", soup, picked=pick,
-                     subgroups=_radios(soup, "ContentPlaceHolder1_rblSubGroup"),
-                     table_found_html_parser=_find_schedule_table(soup) is not None)
-                result = parse_schedule_page(soup)
         summary = {k: result.get(k) for k in ("success", "error", "current_week", "bells")}
         if result.get("weeks"):
             summary["lessons_per_week"] = {w: sum(len(v) for v in days.values()) for w, days in result["weeks"].items()}
