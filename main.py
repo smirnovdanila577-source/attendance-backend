@@ -76,6 +76,10 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> int:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Сессия истекла, войдите заново")
     return user_id
 
+# --- СОЦИАЛЬНАЯ ЧАСТЬ: очки, лига, друзья, публичный профиль, онлайн (social.py) ---
+import social
+app.include_router(social.setup(get_current_user_id))
+
 # --- ЗАЩИТА ОТ ПЕРЕБОРА ПАРОЛЯ (в памяти процесса) ---
 _failed_logins: Dict[str, list] = {}
 MAX_FAILED_ATTEMPTS = 8
