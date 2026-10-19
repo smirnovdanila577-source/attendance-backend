@@ -131,15 +131,16 @@ class XpLedger(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class StudyDay(Base):
-    """Прошедший учебный день, в котором по расписанию были пары (сообщает приложение).
-    Если сервер не дал за него бонус «день закрыт» — этот день рвёт серию."""
-    __tablename__ = "study_days"
+class DayPlan(Base):
+    """Учебный день по расписанию (сообщает приложение): сколько в нём пар и сколько уже закончилось.
+    Из этого сервер знает «возможное» для лиги и какие прошедшие дни не закрыты (они рвут серию)."""
+    __tablename__ = "day_plans"
 
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     day = Column(String, primary_key=True)           # YYYY-MM-DD
-    total = Column(Integer, default=0)               # сколько пар было
-    created_at = Column(DateTime, default=datetime.utcnow)
+    total = Column(Integer, default=0)               # пар в дне
+    ended = Column(Integer, default=0)               # из них уже закончились
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class UserFlags(Base):
