@@ -131,6 +131,17 @@ class XpLedger(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class StudyDay(Base):
+    """Прошедший учебный день, в котором по расписанию были пары (сообщает приложение).
+    Если сервер не дал за него бонус «день закрыт» — этот день рвёт серию."""
+    __tablename__ = "study_days"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    day = Column(String, primary_key=True)           # YYYY-MM-DD
+    total = Column(Integer, default=0)               # сколько пар было
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class UserFlags(Base):
     """Отметки сервера для секретных достижений: заходил ночью / рано утром (по московским часам)."""
     __tablename__ = "user_flags"
