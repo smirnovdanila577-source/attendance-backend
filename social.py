@@ -152,8 +152,8 @@ def _state(db: Session, user_id: int, client_ach: Optional[List[str]] = None) ->
     following = {f.followee_id for f in db.query(models.Follow).filter(models.Follow.follower_id == user_id).all()}
     friend = bool(following) and db.query(models.Follow).filter(
         models.Follow.followee_id == user_id, models.Follow.follower_id.in_(following)).first() is not None
-    st = progress.compute_state(db, user_id, podium=podium, friend=friend)
     p = _profile(db, user_id)
+    st = progress.compute_state(db, user_id, podium=podium, friend=friend, best_floor=p.streak_best or 0)
     if client_ach is None:
         try:
             client_ach = json.loads(p.achievements or "[]")
