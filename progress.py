@@ -6,6 +6,9 @@
     пара закончилась после регистрации и не в будущем;
   * не больше 8 засчитанных пар и 8 пунктов ДЗ в день (по Москве) — больше честного отличника не набрать;
   * пункт ДЗ засчитывается, если от его появления на сервере до выполнения прошло 30+ минут;
+  * серия (огонёк) — учебные дни подряд, закрытые полностью: все пары дня отмечены вовремя
+    (тот же бонус «полностью отмеченный день»). Прошедший день с парами, который не закрыт, серию рвёт;
+    дни без пар её не трогают;
   * отметки задним числом можно ставить для личной статистики, но очков и достижений они не дают.
 Время всегда берётся по часам сервера, часы телефона не важны.
 """
@@ -26,7 +29,7 @@ MARK_WINDOW = timedelta(hours=24)
 FUTURE_SLACK = timedelta(minutes=5)          # расхождение часов телефона и сервера
 TASK_MIN_AGE = timedelta(minutes=30)
 DAILY_PAIRS, DAILY_TASKS = 8, 8
-STREAK_MAX_GAP = 3                           # серия рвётся, если 3 дня подряд нет ни одной засчитанной отметки
+STREAK_SILENT_GAP = 14                       # запасное правило: 14+ дней без закрытых дней (приложение не открывали) — серия с нуля
 
 # Достижения, которые выдаёт сервер (от них зависят аватары и теги)
 SERVER_ACH = {"attend_10", "attend_100", "streak_10", "hw_10", "streak_3", "streak_7", "streak_30", "xp_1000",
@@ -102,6 +105,8 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
     tasks_today = db.query(func.count()).select_from(models.TaskEvent).filter(
         models.TaskEvent.user_id == user.id, models.TaskEvent.counted_on == today).scalar() or 0
     created = user.created_at or now
+    created_day = msk_today(created)
+    final_day = (date.fromisoformat(today) - timedelta(days=2)).isoformat()   # дни не позже позавчера уже не закрыть
 
     for ev in events[:200]:
         kind = ev.get("type")
@@ -143,6 +148,16 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
                     models.XpLedger.user_id == user.id, models.XpLedger.ref == ref).first():
                 _award(db, user.id, XP_FULL_DAY, "day", ref, now); gained += XP_FULL_DAY
 
+        elif kind == "day":
+            # Прошедший учебный день с парами. Только окончательные дни: отметки вчерашних пар ещё могут успеть
+            pdate = str(ev.get("date") or "")
+            total = int(ev.get("total") or 0) if str(ev.get("total") or "0").isdigit() else 0
+            if not DATE_RE.match(pdate) or total < 1 or pdate > final_day or pdate < created_day:
+                continue
+            if not db.get(models.StudyDay, (user.id, pdate)):
+                db.add(models.StudyDay(user_id=user.id, day=pdate, total=min(total, DAILY_PAIRS), created_at=now))
+                db.flush()
+
         elif kind in ("task_add", "task_done"):
             key = str(ev.get("key") or "")[:80]
             if not key:
@@ -166,16 +181,23 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
 
 # ---------- Итоги ----------
 
-def _streaks(dates: Set[str], today: str):
-    """Серия — дни с засчитанными отметками; рвётся, если между ними 3+ пустых дня."""
-    if not dates:
-        return 0, 0
-    ds = sorted(date.fromisoformat(d) for d in dates)
-    best = run = 1
-    for a, b in zip(ds, ds[1:]):
-        run = run + 1 if (b - a).days <= STREAK_MAX_GAP else 1
-        best = max(best, run)
-    current = run if (date.fromisoformat(today) - ds[-1]).days <= STREAK_MAX_GAP else 0
+def _streaks(closed: Set[str], open_days: Set[str], today: str):
+    """Серия — закрытые учебные дни подряд. Незакрытый прошедший день с парами рвёт её,
+    дни без пар не считаются вовсе. Сегодня и вчера ещё можно закрыть — они серию не рвут."""
+    days = sorted(closed | open_days)
+    best = run = 0
+    last = None
+    for d in days:
+        cur = date.fromisoformat(d)
+        if d in closed:
+            if last and (cur - last).days > STREAK_SILENT_GAP:
+                run = 0
+            run += 1
+            last = cur
+            best = max(best, run)
+        else:
+            run = 0
+    current = run if last and (date.fromisoformat(today) - last).days <= STREAK_SILENT_GAP else 0
     return current, best
 
 
@@ -186,7 +208,7 @@ def xp_by_week(db: Session, week: str, user_ids: Optional[List[int]] = None) -> 
     return {uid: int(x or 0) for uid, x in q.group_by(models.XpLedger.user_id).all()}
 
 
-def compute_state(db: Session, user_id: int, podium: bool = False, friend: bool = False) -> dict:
+def compute_state(db: Session, user_id: int, podium: bool = False, friend: bool = False, best_floor: int = 0) -> dict:
     """Всё, что сервер знает о прогрессе пользователя. podium/friend считает social.py."""
     now = now_utc()
     today = msk_today(now)
@@ -198,7 +220,12 @@ def compute_state(db: Session, user_id: int, podium: bool = False, friend: bool 
     xp_total = int(db.query(func.sum(models.XpLedger.xp)).filter(models.XpLedger.user_id == user_id).scalar() or 0)
     wk = week_key_of(now)
     week_xp = xp_by_week(db, wk, [user_id]).get(user_id, 0)
-    streak, best = _streaks({m.pair_date for m in marks if m.status in ("a", "m")}, today)
+    # Закрытый день = начислен бонус «полностью отмеченный день»
+    closed = {ref[4:] for (ref,) in db.query(models.XpLedger.ref).filter(
+        models.XpLedger.user_id == user_id, models.XpLedger.reason == "day").all() if ref.startswith("day:")}
+    open_days = {d for (d,) in db.query(models.StudyDay.day).filter(models.StudyDay.user_id == user_id).all()} - closed
+    streak, best = _streaks(closed, open_days, today)
+    best = max(best, best_floor or 0)        # уже полученные достижения за серию не отнимаем
 
     weeks = {}
     for m in marks:
