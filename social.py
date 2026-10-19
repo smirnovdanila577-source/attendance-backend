@@ -69,15 +69,21 @@ def _status(p: Optional[models.PublicProfile]) -> str:
     return "online" if _is_online(p) else "offline"
 
 
-def _card(db: Session, user: models.User, p: Optional[models.PublicProfile], week_xp: int = 0, full: bool = False) -> dict:
-    """Карточка пользователя для лиги, друзей и публичного профиля."""
+def _card(db: Session, user: models.User, p: Optional[models.PublicProfile], week_xp: int = 0, full: bool = False,
+          lg: Optional[dict] = None) -> dict:
+    """Карточка пользователя для лиги, друзей и публичного профиля. lg — результат недели из progress.league_scores."""
+    lg = lg or {}
     card = {
         "id": user.id,
         "name": user.username,
         "avatar": (p.avatar if p else "") or "",
         "tag": (p.tag if p else "newbie") or "",
         "streak": p.streak_days if p else 0,
-        "week_xp": week_xp,
+        "week_xp": week_xp,                                  # очки опыта за неделю (старые версии приложения)
+        "score": lg.get("score", 0),                         # лига: процент от возможного
+        "pairs_done": lg.get("pairs_done", 0),
+        "pairs_total": lg.get("pairs_total", 0),
+        "ranked": bool(lg.get("ranked")),                     # от 6 пар в неделю — в зачёте
         "status": _status(p),
     }
     if full:
@@ -124,11 +130,13 @@ class EventsRequest(BaseModel):
 
 
 def _league_members(db: Session, wk: str, user_id: int, include_me: bool):
-    """Участники лиги недели wk с местами. Пока людей мало — одна лига; потом группы по LEAGUE_SIZE."""
-    active = {uid: xp for uid, xp in progress.xp_by_week(db, wk).items() if xp > 0}
+    """Участники лиги недели wk. Место — по проценту от возможного (см. progress.league_scores);
+    при равном проценте выше тот, кто набрал его раньше. Недели меньше чем с 6 парами — без места, ниже черты."""
+    scores = {uid: v for uid, v in progress.league_scores(db, wk).items() if v["possible"] > 0}
     if include_me:
-        active.setdefault(user_id, 0)
-    ids = sorted(active)
+        scores.setdefault(user_id, {"score": 0, "earned": 0, "possible": 0, "pairs_done": 0, "pairs_total": 0,
+                                    "ranked": False, "last_at": None})
+    ids = sorted(scores)
     if len(ids) > LEAGUE_SIZE:
         # Стабильное деление на группы на всю неделю: по хэшу (неделя + id), чтобы соседи не менялись
         groups = max(1, round(len(ids) / LEAGUE_SIZE))
@@ -137,10 +145,24 @@ def _league_members(db: Session, wk: str, user_id: int, include_me: bool):
         ids = [i for i in ids if gid(i) == mine]
     users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_(ids)).all()} if ids else {}
     profs = {p.user_id: p for p in db.query(models.PublicProfile).filter(models.PublicProfile.user_id.in_(ids)).all()} if ids else {}
-    members = [_card(db, users[i], profs.get(i), active.get(i, 0)) for i in ids if i in users]
-    members.sort(key=lambda c: (-c["week_xp"], c["name"].lower()))
-    for n, c in enumerate(members, 1):
-        c["rank"] = n
+    xp = progress.xp_by_week(db, wk, ids) if ids else {}
+    far = datetime.max
+    ranked = sorted((i for i in ids if i in users and scores[i]["ranked"]),
+                    key=lambda i: (-scores[i]["score"], scores[i]["last_at"] or far))
+    rest = sorted((i for i in ids if i in users and not scores[i]["ranked"]),
+                  key=lambda i: (-scores[i]["score"], users[i].username.lower()))
+    members, prev, rank = [], None, 0
+    for n, i in enumerate(ranked, 1):
+        key = (scores[i]["score"], scores[i]["last_at"])
+        rank = rank if key == prev else n          # полное совпадение — одно место на двоих
+        prev = key
+        c = _card(db, users[i], profs.get(i), xp.get(i, 0), lg=scores[i])
+        c["rank"] = rank
+        members.append(c)
+    for i in rest:
+        c = _card(db, users[i], profs.get(i), xp.get(i, 0), lg=scores[i])
+        c["rank"] = None
+        members.append(c)
     return members
 
 
@@ -148,7 +170,8 @@ def _state(db: Session, user_id: int, client_ach: Optional[List[str]] = None) ->
     """Прогресс по версии сервера + обновление публичного профиля этими цифрами."""
     prev = _league_members(db, prev_week_key(), user_id, include_me=False)
     me = next((c for c in prev if c["id"] == user_id), None)
-    podium = bool(me and me["rank"] <= 3 and me["week_xp"] > 0 and len(prev) >= 3)
+    podium = bool(me and me["ranked"] and me["rank"] and me["rank"] <= 3 and me["score"] > 0
+                  and sum(1 for c in prev if c["ranked"]) >= 3)
     following = {f.followee_id for f in db.query(models.Follow).filter(models.Follow.follower_id == user_id).all()}
     friend = bool(following) and db.query(models.Follow).filter(
         models.Follow.followee_id == user_id, models.Follow.follower_id.in_(following)).first() is not None
@@ -236,6 +259,7 @@ def setup(get_current_user_id):
             "members": members,
             "my_rank": me["rank"] if me else None,
             "size": len(members),
+            "rules": {"min_pairs": progress.LEAGUE_MIN_PAIRS, "week_pairs": progress.WEEKLY_PAIRS},
         }
 
     @router.get("/friends")
@@ -247,16 +271,17 @@ def setup(get_current_user_id):
         profs = {p.user_id: p for p in db.query(models.PublicProfile).filter(models.PublicProfile.user_id.in_(ids)).all()} if ids else {}
         wk = week_key()
         xp = progress.xp_by_week(db, wk, ids) if ids else {}
+        lg = progress.league_scores(db, wk, ids) if ids else {}
         out = []
         for i in ids:
             if i not in users:
                 continue
-            c = _card(db, users[i], profs.get(i), xp.get(i, 0))
+            c = _card(db, users[i], profs.get(i), xp.get(i, 0), lg=lg.get(i))
             c["you_follow"] = i in following
             c["follows_you"] = i in followers
             c["mutual"] = c["you_follow"] and c["follows_you"]
             out.append(c)
-        out.sort(key=lambda c: (not c["mutual"], not c["you_follow"], -c["week_xp"], c["name"].lower()))
+        out.sort(key=lambda c: (not c["mutual"], not c["you_follow"], -c["score"], c["name"].lower()))
         return {"friends": out, "mutual_count": sum(1 for c in out if c["mutual"])}
 
     @router.post("/friends/follow")
@@ -288,7 +313,9 @@ def setup(get_current_user_id):
         if not user:
             raise HTTPException(status_code=404, detail="Пользователь не найден")
         p = db.get(models.PublicProfile, user.id)
-        card = _card(db, user, p, progress.xp_by_week(db, week_key(), [user.id]).get(user.id, 0), full=True)
+        wk = week_key()
+        card = _card(db, user, p, progress.xp_by_week(db, wk, [user.id]).get(user.id, 0), full=True,
+                     lg=progress.league_scores(db, wk, [user.id]).get(user.id))
         card["you_follow"] = bool(db.get(models.Follow, (user_id, user.id)))
         card["follows_you"] = bool(db.get(models.Follow, (user.id, user_id)))
         return card
