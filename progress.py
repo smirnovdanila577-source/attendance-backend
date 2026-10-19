@@ -9,6 +9,10 @@
   * серия (огонёк) — учебные дни подряд, закрытые полностью: все пары дня отмечены вовремя
     (тот же бонус «полностью отмеченный день»). Прошедший день с парами, который не закрыт, серию рвёт;
     дни без пар её не трогают;
+  * лига недели — процент от возможного: (10 × засчитанные пары + 5 × закрытые дни) / (то же для всех
+    закончившихся пар и дней недели). У кого пар меньше, у того и максимум меньше — шансы равные.
+    В зачёт идут недели от 6 пар; больше 30 пар в неделю не засчитывается (выдуманные пары не помогают);
+  * ДЗ даёт очки опыта, но не входит в лигу; за неделю засчитывается не больше 2 пунктов на пару;
   * отметки задним числом можно ставить для личной статистики, но очков и достижений они не дают.
 Время всегда берётся по часам сервера, часы телефона не важны.
 """
@@ -29,6 +33,9 @@ MARK_WINDOW = timedelta(hours=24)
 FUTURE_SLACK = timedelta(minutes=5)          # расхождение часов телефона и сервера
 TASK_MIN_AGE = timedelta(minutes=30)
 DAILY_PAIRS, DAILY_TASKS = 8, 8
+WEEKLY_PAIRS = 30                            # больше пар в неделю не засчитывается
+LEAGUE_MIN_PAIRS = 6                         # с меньшим числом пар неделя в лиге не идёт в зачёт
+TASKS_PER_PAIR = 2                           # засчитанных пунктов ДЗ за неделю — не больше 2 на засчитанную пару
 STREAK_SILENT_GAP = 14                       # запасное правило: 14+ дней без закрытых дней (приложение не открывали) — серия с нуля
 
 # Достижения, которые выдаёт сервер (от них зависят аватары и теги)
@@ -63,6 +70,19 @@ def week_key_of(now: Optional[datetime] = None) -> str:
     n = (now or now_utc()).replace(tzinfo=timezone.utc).astimezone(MSK)
     y, w, _ = n.isocalendar()
     return f"{y}-W{w:02d}"
+
+
+def week_bounds(day_iso: str):
+    """Понедельник и воскресенье недели, в которую попадает день (YYYY-MM-DD)."""
+    d = date.fromisoformat(day_iso)
+    mon = d - timedelta(days=d.weekday())
+    return mon.isoformat(), (mon + timedelta(days=6)).isoformat()
+
+
+def week_bounds_of_key(wk: str):
+    y, w = wk.split("-W")
+    mon = date.fromisocalendar(int(y), int(w), 1)
+    return mon.isoformat(), (mon + timedelta(days=6)).isoformat()
 
 
 def _parse_end(value: str) -> Optional[datetime]:
@@ -107,6 +127,21 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
     created = user.created_at or now
     created_day = msk_today(created)
     final_day = (date.fromisoformat(today) - timedelta(days=2)).isoformat()   # дни не позже позавчера уже не закрыть
+    wk_mon, wk_sun = week_bounds(today)
+    week_pairs = {}                                   # засчитано пар по неделям пар (для лимита 30)
+    def pairs_in_week(pdate):
+        mon, sun = week_bounds(pdate)
+        if mon not in week_pairs:
+            week_pairs[mon] = db.query(func.count()).select_from(models.MarkEvent).filter(
+                models.MarkEvent.user_id == user.id, models.MarkEvent.counted == True,  # noqa: E712
+                models.MarkEvent.pair_date >= mon, models.MarkEvent.pair_date <= sun).scalar() or 0
+        return mon
+    tasks_week = db.query(func.count()).select_from(models.TaskEvent).filter(
+        models.TaskEvent.user_id == user.id, models.TaskEvent.counted == True,  # noqa: E712
+        models.TaskEvent.counted_on >= wk_mon, models.TaskEvent.counted_on <= wk_sun).scalar() or 0
+    pairs_week_now = db.query(func.count()).select_from(models.MarkEvent).filter(
+        models.MarkEvent.user_id == user.id, models.MarkEvent.counted == True,  # noqa: E712
+        models.MarkEvent.counted_on >= wk_mon, models.MarkEvent.counted_on <= wk_sun).scalar() or 0
 
     for ev in events[:200]:
         kind = ev.get("type")
@@ -134,8 +169,13 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
                 continue
             if end < created or pairs_today >= DAILY_PAIRS:
                 continue
+            wkey = pairs_in_week(pdate)
+            if week_pairs[wkey] >= WEEKLY_PAIRS:
+                continue
             m.counted, m.counted_on = True, today
             pairs_today += 1
+            week_pairs[wkey] += 1
+            pairs_week_now += 1
             _award(db, user.id, XP_PAIR, "pair", key, now); gained += XP_PAIR
             # Бонус за полностью отмеченный день (сколько пар в дне, сообщает приложение, не больше 8)
             total = max(1, min(int(ev.get("day_total") or 0), DAILY_PAIRS))
@@ -149,14 +189,21 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
                 _award(db, user.id, XP_FULL_DAY, "day", ref, now); gained += XP_FULL_DAY
 
         elif kind == "day":
-            # Прошедший учебный день с парами. Только окончательные дни: отметки вчерашних пар ещё могут успеть
+            # Учебный день по расписанию: сколько пар и сколько из них уже закончилось (для лиги и серии)
             pdate = str(ev.get("date") or "")
-            total = int(ev.get("total") or 0) if str(ev.get("total") or "0").isdigit() else 0
-            if not DATE_RE.match(pdate) or total < 1 or pdate > final_day or pdate < created_day:
+            num = lambda v: int(v) if str(v).isdigit() else 0
+            total = min(num(ev.get("total") or 0), DAILY_PAIRS)
+            ended = min(num(ev.get("ended") if ev.get("ended") is not None else total), total)
+            if not DATE_RE.match(pdate) or total < 1 or pdate > today or pdate < created_day:
                 continue
-            if not db.get(models.StudyDay, (user.id, pdate)):
-                db.add(models.StudyDay(user_id=user.id, day=pdate, total=min(total, DAILY_PAIRS), created_at=now))
+            if pdate <= final_day:
+                ended = total                         # прошедший день закончился целиком
+            d = db.get(models.DayPlan, (user.id, pdate))
+            if not d:
+                db.add(models.DayPlan(user_id=user.id, day=pdate, total=total, ended=ended, updated_at=now))
                 db.flush()
+            elif pdate > final_day or not d.total:    # окончательный день уже не меняем
+                d.total, d.ended, d.updated_at = total, ended, now
 
         elif kind in ("task_add", "task_done"):
             key = str(ev.get("key") or "")[:80]
@@ -169,9 +216,11 @@ def apply_events(db: Session, user: models.User, events: List[dict]) -> dict:
                 db.flush()
             if kind == "task_done" and not t.counted:
                 t.done_at = now
-                if now - t.first_seen >= TASK_MIN_AGE and tasks_today < DAILY_TASKS:
+                if (now - t.first_seen >= TASK_MIN_AGE and tasks_today < DAILY_TASKS
+                        and tasks_week < TASKS_PER_PAIR * pairs_week_now):
                     t.counted, t.counted_on = True, today
                     tasks_today += 1
+                    tasks_week += 1
                     _award(db, user.id, XP_TASK, "task", key, now); gained += XP_TASK
 
     touch_flags(db, user.id, now)
@@ -208,6 +257,57 @@ def xp_by_week(db: Session, week: str, user_ids: Optional[List[int]] = None) -> 
     return {uid: int(x or 0) for uid, x in q.group_by(models.XpLedger.user_id).all()}
 
 
+def league_scores(db: Session, wk: str, user_ids: Optional[List[int]] = None) -> dict:
+    """Лига недели wk: процент от возможного для каждого, у кого в неделе есть пары или очки.
+    Возвращает {user_id: {score, earned, possible, pairs_done, pairs_total, ranked, last_at}}."""
+    mon, sun = week_bounds_of_key(wk)
+    flt = lambda q, col: q.filter(col >= mon, col <= sun)
+    plans = db.query(models.DayPlan.user_id, models.DayPlan.day, models.DayPlan.total, models.DayPlan.ended)
+    plans = flt(plans, models.DayPlan.day)
+    marks = db.query(models.MarkEvent.user_id, models.MarkEvent.pair_date, func.count()).filter(
+        models.MarkEvent.counted == True)  # noqa: E712
+    marks = flt(marks, models.MarkEvent.pair_date)
+    days = db.query(models.XpLedger.user_id, models.XpLedger.ref, models.XpLedger.created_at).filter(
+        models.XpLedger.reason == "day", models.XpLedger.ref >= f"day:{mon}", models.XpLedger.ref <= f"day:{sun}")
+    # Когда набран нынешний результат — для ничьей: выше тот, кто набрал раньше
+    start = datetime.combine(date.fromisoformat(mon), datetime.min.time(), MSK).astimezone(timezone.utc).replace(tzinfo=None)
+    last = db.query(models.XpLedger.user_id, func.max(models.XpLedger.created_at)).filter(
+        models.XpLedger.reason.in_(("pair", "day")), models.XpLedger.created_at >= start,
+        models.XpLedger.created_at < start + timedelta(days=8))   # +1 день: отметки воскресных пар в понедельник
+    if user_ids is not None:
+        plans = plans.filter(models.DayPlan.user_id.in_(user_ids))
+        marks = marks.filter(models.MarkEvent.user_id.in_(user_ids))
+        days = days.filter(models.XpLedger.user_id.in_(user_ids))
+        last = last.filter(models.XpLedger.user_id.in_(user_ids))
+    per = {}                                          # user -> day -> [total, ended, counted, closed]
+    for uid, d, total, ended in plans.all():
+        per.setdefault(uid, {}).setdefault(d, [0, 0, 0, False])[0:2] = [total or 0, ended or 0]
+    for uid, d, n in marks.group_by(models.MarkEvent.user_id, models.MarkEvent.pair_date).all():
+        per.setdefault(uid, {}).setdefault(d, [0, 0, 0, False])[2] = n
+    for uid, ref, _ in days.all():
+        per.setdefault(uid, {}).setdefault(ref[4:], [0, 0, 0, False])[3] = True
+    last_at = dict(last.group_by(models.XpLedger.user_id).all())
+    out = {}
+    for uid, dd in per.items():
+        done = poss = full_poss = full_done = planned = 0
+        for total, ended, counted, closed in dd.values():
+            poss += max(ended, counted)               # старые версии приложения не сообщали расписание
+            planned += ended
+            done += counted
+            if closed:
+                full_done += 1; full_poss += 1
+            elif total and ended >= total:
+                full_poss += 1
+        done, poss = min(done, WEEKLY_PAIRS), min(poss, WEEKLY_PAIRS)
+        earned = XP_PAIR * done + XP_FULL_DAY * full_done
+        possible = XP_PAIR * poss + XP_FULL_DAY * full_poss
+        out[uid] = {"score": round(100 * earned / possible) if possible else 0, "earned": earned, "possible": possible,
+                    # в зачёте — только если расписание известно серверу (иначе без возможного любой был бы на 100%)
+                    "pairs_done": done, "pairs_total": poss, "ranked": planned >= LEAGUE_MIN_PAIRS,
+                    "last_at": last_at.get(uid)}
+    return out
+
+
 def compute_state(db: Session, user_id: int, podium: bool = False, friend: bool = False, best_floor: int = 0) -> dict:
     """Всё, что сервер знает о прогрессе пользователя. podium/friend считает social.py."""
     now = now_utc()
@@ -223,7 +323,9 @@ def compute_state(db: Session, user_id: int, podium: bool = False, friend: bool 
     # Закрытый день = начислен бонус «полностью отмеченный день»
     closed = {ref[4:] for (ref,) in db.query(models.XpLedger.ref).filter(
         models.XpLedger.user_id == user_id, models.XpLedger.reason == "day").all() if ref.startswith("day:")}
-    open_days = {d for (d,) in db.query(models.StudyDay.day).filter(models.StudyDay.user_id == user_id).all()} - closed
+    final_day = (date.fromisoformat(today) - timedelta(days=2)).isoformat()
+    open_days = {d for (d,) in db.query(models.DayPlan.day).filter(
+        models.DayPlan.user_id == user_id, models.DayPlan.total > 0, models.DayPlan.day <= final_day).all()} - closed
     streak, best = _streaks(closed, open_days, today)
     best = max(best, best_floor or 0)        # уже полученные достижения за серию не отнимаем
 
